@@ -1,0 +1,184 @@
+---
+metadata:
+  extracted_at: "Sun Dec 14 12:17:07 2025"
+  total_commands: 17
+  extractor_version: "2.0"
+sql_commands:
+  - id: alter_58_complex_select
+    sql: |
+      ALTER TABLE users
+      ADD COLUMN phone VARCHAR(20) AFTER email
+    meta:
+      type: "ALTER"
+      line_number: 58
+      variable_name: "complex_select"
+      source: "direct_match"
+  - id: delete_88_risky_query
+    sql: |
+      DELETE ON database.users
+      FROM 'app_user'@'localhost'
+    meta:
+      type: "DELETE"
+      line_number: 88
+      variable_name: "risky_query"
+      source: "direct_match"
+  - id: insert_76_risky_query
+    sql: |
+      INSERT
+      INTO critical_data (value)
+      VALUES ('important')"
+    meta:
+      type: "INSERT"
+      line_number: 76
+      variable_name: "risky_query"
+      source: "direct_match"
+  - id: revoke_88_risky_query
+    sql: |
+      REVOKE DELETE
+      ON database.users
+      FROM 'app_user'@'localhost'
+    meta:
+      type: "REVOKE"
+      line_number: 88
+      variable_name: "risky_query"
+      source: "direct_match"
+  - id: select_94_dynamic_sql
+    sql: |
+      SELECT *
+      FROM products
+      WHERE category = '$category'
+      AND price < $max_price"
+    meta:
+      type: "SELECT"
+      line_number: 94
+      variable_name: "dynamic_sql"
+      source: "direct_match"
+  - id: select_97_dynamic_sql
+    sql: |
+      SELECT COUNT(*)
+      FROM orders
+      WHERE status = 'completed'"
+    meta:
+      type: "SELECT"
+      line_number: 97
+      variable_name: "dynamic_sql"
+      source: "direct_match"
+  - id: update_63_transfer_from
+    sql: |
+      UPDATE accounts
+      SET balance = balance - 100
+      WHERE id = 1"
+    meta:
+      type: "UPDATE"
+      line_number: 63
+      variable_name: "transfer_from"
+      source: "direct_match"
+  - id: update_63_transfer_to
+    sql: |
+      UPDATE accounts
+      SET balance = balance + 100
+      WHERE id = 2"
+    meta:
+      type: "UPDATE"
+      line_number: 63
+      variable_name: "transfer_to"
+      source: "direct_match"
+  - id: update_87_risky_query
+    sql: |
+      UPDATE ON database.users TO 'app_user'@'localhost'
+    meta:
+      type: "UPDATE"
+      line_number: 87
+      variable_name: "risky_query"
+      source: "direct_match"
+  - id: select_11_select_users
+    sql: |
+      SELECT id
+      , name
+      , email
+      FROM users
+      WHERE active = 1
+    meta:
+      type: "SELECT"
+      line_number: 11
+      variable_name: "select_users"
+      source: "quoted_string"
+  - id: insert_19_insert_query
+    sql: |
+      INSERT
+      INTO users (
+      name
+      , email
+      , created_at
+      )
+      VALUES ('John Doe', 'john@example.com', NOW())
+    meta:
+      type: "INSERT"
+      line_number: 19
+      variable_name: "insert_query"
+      source: "quoted_string"
+  - id: update_23_update_sql
+    sql: |
+      UPDATE users
+      SET last_login = NOW()
+      WHERE id = ?
+    meta:
+      type: "UPDATE"
+      line_number: 23
+      variable_name: "update_sql"
+      source: "quoted_string"
+  - id: update_63_transfer_from
+    sql: |
+      UPDATE accounts
+      SET balance = balance - 100
+      WHERE id = 1
+    meta:
+      type: "UPDATE"
+      line_number: 63
+      variable_name: "transfer_from"
+      source: "quoted_string"
+  - id: update_63_transfer_to
+    sql: |
+      UPDATE accounts
+      SET balance = balance + 100
+      WHERE id = 2
+    meta:
+      type: "UPDATE"
+      line_number: 63
+      variable_name: "transfer_to"
+      source: "quoted_string"
+  - id: insert_76_risky_query
+    sql: |
+      INSERT
+      INTO critical_data (value)
+      VALUES ('important')
+    meta:
+      type: "INSERT"
+      line_number: 76
+      variable_name: "risky_query"
+      source: "quoted_string"
+  - id: select_94_dynamic_sql
+    sql: |
+      SELECT *
+      FROM products
+      WHERE category = '$category'
+      AND price < $max_price
+    meta:
+      type: "SELECT"
+      line_number: 94
+      variable_name: "dynamic_sql"
+      source: "quoted_string"
+  - id: insert_103_insert_select_query
+    sql: |
+      INSERT
+      INTO user_backup (
+      id
+      , name
+      , email
+      , created_at
+      ) SELECT id, name, email, NOW() FROM users WHERE active = 1 AND last_login > DATE_SUB(NOW(), INTERVAL 30 DAY)
+    meta:
+      type: "INSERT"
+      line_number: 103
+      variable_name: "insert_select_query"
+      source: "quoted_string"
