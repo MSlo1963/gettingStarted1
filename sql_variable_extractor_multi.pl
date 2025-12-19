@@ -117,44 +117,66 @@ sub extract_sql_variables_multi {
         \s*;?                       # Optional semicolon
     /xms;
 
-    # Find ALL variable assignments (global match with 'g' flag)
-    my $match_count = 0;
-    while ($clean_content =~ /$var_assignment_pattern/g) {
-        $match_count++;
-        my $var_name = $1;
-        my $quote_char = $2;
-        my $sql_content = $3 || $4 || $5 || $6 || $7 || $8 || '';
+    # Find ALL variable assignments by searching through original content line by line
+    my @original_lines = split /\n/, $content;
 
-        # Skip if no SQL content
-        next unless $sql_content;
+    for my $line_num (1 .. @original_lines) {
+        my $line = $original_lines[$line_num - 1];
 
-        # Check if it looks like SQL (more comprehensive check)
-        next unless $sql_content =~ /\b(?:SELECT|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|TRUNCATE|GRANT|REVOKE|WITH|BEGIN|COMMIT|ROLLBACK|CALL|EXECUTE|SHOW|DESCRIBE|EXPLAIN)\b/i;
+        # Skip comment lines
+        next if $line =~ /^\s*#/;
+        next if $line =~ /^\s*\/\//;
 
-        # Find line number using original content (with comments)
-        my $match_pos = pos($clean_content) - length($&);
-        my $line_number = find_line_number($content, $clean_content, $match_pos, $sql_content);
+        # Check if this line contains a variable assignment with SQL
+        if ($line =~ /$var_assignment_pattern/) {
+            my $var_name = $1;
+            my $quote_char = $2;
+            my $sql_content = $3 || $4 || $5 || $6 || $7 || $8 || '';
 
-        # Clean and format SQL
-        my $cleaned_sql = clean_and_format_sql($sql_content);
-        my $sql_type = detect_sql_type($cleaned_sql);
+            # Skip if no SQL content
+            next unless $sql_content;
 
-        # Create unique identifier for this assignment
-        my $base_var_name = $var_name;
-        $base_var_name =~ s/^\$//; # Remove $ prefix for cleaner names
-        my $unique_id = sprintf("%s_line_%d", $base_var_name, $line_number);
+            # Check if it looks like SQL (more comprehensive check)
+            next unless $sql_content =~ /\b(?:SELECT|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|TRUNCATE|GRANT|REVOKE|WITH|BEGIN|COMMIT|ROLLBACK|CALL|EXECUTE|SHOW|DESCRIBE|EXPLAIN)\b/i;
 
-        # Store assignment info with unique identifier
-        push @found_assignments, {
-            unique_id => $unique_id,
-            variable_name => $base_var_name,
-            original_var => $var_name,
-            sql => $cleaned_sql,
-            type => $sql_type,
-            line_number => $line_number,
-            quote_style => $quote_char || 'special',
-            assignment_number => count_previous_assignments(\@found_assignments, $base_var_name) + 1,
-        };
+            # For multi-line assignments, we need to capture the full SQL
+            my $full_sql = $sql_content;
+
+            # If the SQL seems incomplete (no semicolon and looks cut off), try to get more lines
+            if ($sql_content !~ /;\s*$/ && $sql_content !~ /\b(?:FROM|WHERE|ORDER|GROUP|HAVING|LIMIT)\b/i && length($sql_content) > 50) {
+                # Look at next few lines to complete the SQL
+                for my $next_line_idx ($line_num .. min($line_num + 10, @original_lines)) {
+                    my $next_line = $original_lines[$next_line_idx - 1] || "";
+                    last if $next_line =~ /^\s*\$\w+/;  # Stop at next variable assignment
+                    last if $next_line =~ /;\s*$/;       # Stop at semicolon
+                    if ($next_line =~ /^\s*"([^"]*)"/) {
+                        $full_sql .= " " . $1;
+                        last if $1 =~ /;\s*$/;
+                    }
+                }
+            }
+
+            # Clean and format SQL
+            my $cleaned_sql = clean_and_format_sql($full_sql);
+            my $sql_type = detect_sql_type($cleaned_sql);
+
+            # Create unique identifier for this assignment
+            my $base_var_name = $var_name;
+            $base_var_name =~ s/^\$//; # Remove $ prefix for cleaner names
+            my $unique_id = sprintf("%s_line_%d", $base_var_name, $line_num);
+
+            # Store assignment info with unique identifier
+            push @found_assignments, {
+                unique_id => $unique_id,
+                variable_name => $base_var_name,
+                original_var => $var_name,
+                sql => $cleaned_sql,
+                type => $sql_type,
+                line_number => $line_num,
+                quote_style => $quote_char || 'special',
+                assignment_number => count_previous_assignments(\@found_assignments, $base_var_name) + 1,
+            };
+        }
     }
 
     return \@found_assignments;
@@ -190,24 +212,53 @@ sub remove_comments {
 sub find_line_number {
     my ($original_content, $clean_content, $clean_pos, $sql_snippet) = @_;
 
-    # Find a unique part of the SQL to locate in original content
-    my $search_snippet = substr($sql_snippet, 0, 30);
-    $search_snippet =~ s/^\s+|\s+$//g; # trim
+    # Get the position in clean content and map back to original content
+    my $before_clean = substr($clean_content, 0, $clean_pos);
+    my $clean_line_count = ($before_clean =~ tr/\n//) + 1;
 
-    # Search for this snippet in the original content
-    my $pos = index($original_content, $search_snippet);
-    if ($pos == -1) {
-        # Fallback: try to estimate based on clean content position
-        my $before_clean = substr($clean_content, 0, $clean_pos);
-        my $line_count = ($before_clean =~ tr/\n//) + 1;
-        return $line_count;
+    # Split both contents into lines for accurate mapping
+    my @original_lines = split /\n/, $original_content;
+    my @clean_lines = split /\n/, $clean_content;
+
+    # Try to find a unique identifier in the SQL for precise matching
+    my $search_snippet = $sql_snippet;
+    $search_snippet =~ s/^\s+|\s+$//g; # trim whitespace
+
+    # Take first 20 chars of SQL as identifier, but make it more unique
+    my $identifier = substr($search_snippet, 0, 20);
+    $identifier =~ s/\s+/ /g; # normalize spaces
+
+    # Search through original content line by line around the estimated position
+    my $search_start = max(1, $clean_line_count - 10);
+    my $search_end = min(scalar(@original_lines), $clean_line_count + 10);
+
+    for my $line_num ($search_start .. $search_end) {
+        my $line = $original_lines[$line_num - 1] || "";
+
+        # Check if this line contains our SQL snippet
+        if (index($line, $identifier) != -1) {
+            return $line_num;
+        }
+
+        # Also check if line contains variable assignment with our SQL type
+        my $sql_type = detect_sql_type($sql_snippet);
+        if ($line =~ /\$\w+\s*=.*$sql_type/i) {
+            return $line_num;
+        }
     }
 
-    # Count newlines before the found position
-    my $before_match = substr($original_content, 0, $pos);
-    my $line_number = ($before_match =~ tr/\n//) + 1;
+    # Fallback: return the estimated line count from clean content
+    return $clean_line_count;
+}
 
-    return $line_number;
+sub max {
+    my ($a, $b) = @_;
+    return $a > $b ? $a : $b;
+}
+
+sub min {
+    my ($a, $b) = @_;
+    return $a < $b ? $a : $b;
 }
 
 sub clean_and_format_sql {
