@@ -3,9 +3,10 @@ use strict;
 use warnings;
 use Getopt::Long;
 
-# Enhanced SQL Variable Extractor - Fixed Line Number Detection
+# Enhanced SQL Variable Extractor - Fixed Line Number Detection with Comment Conversion
 # Extracts ALL SQL statements stored in Perl variables, including multiple assignments
 # to the same variable name, with accurate line number detection
+# Converts /* */ comments to -- comments for Sybase/PostgreSQL compatibility
 
 # Command line options
 my @target_variables = ();
@@ -36,7 +37,7 @@ unless (-f $input_file) {
 
 sub show_usage {
     print <<'USAGE';
-SQL Variable Extractor v2.3 - Extract ALL SQL statements from Perl variables (Fixed Line Numbers)
+SQL Variable Extractor v2.4 - Extract ALL SQL statements from Perl variables (Fixed Line Numbers + Comment Conversion)
 
 SYNOPSIS:
     sql_variable_extractor_fixed.pl [options] <input_file>
@@ -53,6 +54,7 @@ FEATURES:
     - Each assignment gets a unique identifier with correct line number
     - Supports all common Perl quoting styles
     - Formatted SQL output with proper indentation
+    - Converts /* */ comments to -- comments for Sybase/PostgreSQL compatibility
 
 EXAMPLES:
     # Extract all SQL variables (including multiple assignments)
@@ -218,14 +220,56 @@ sub count_previous_assignments {
 sub clean_and_format_sql {
     my $sql = shift;
 
+    # Convert /* */ comments to -- comments for Sybase/PostgreSQL compatibility
+    $sql = convert_sql_comments($sql);
+
     # Remove leading/trailing whitespace
     $sql =~ s/^\s+|\s+$//g;
 
-    # Normalize whitespace
-    $sql =~ s/\s+/ /g;
+    # Normalize whitespace but preserve line breaks after comment conversion
+    $sql =~ s/[ \t]+/ /g;  # normalize spaces and tabs, but keep newlines
+    $sql =~ s/ *\n */\n/g; # clean up spaces around newlines
 
     # Basic SQL formatting
     $sql = format_sql($sql);
+
+    return $sql;
+}
+
+sub convert_sql_comments {
+    my $sql = shift;
+
+    # Handle multi-line /* */ comments first
+    $sql =~ s{/\*\s*(.*?)\s*\*/}{
+
+        my $comment_content = $1;
+
+        # Check if this is a single-line comment within /* */
+        if ($comment_content !~ /\n/) {
+            # Single line comment - simple conversion
+            $comment_content =~ s/^\s+|\s+$//g;  # trim whitespace
+            "-- $comment_content";
+        } else {
+            # Multi-line comment - convert each line and preserve structure
+            my @lines = split /\n/, $comment_content;
+            my $converted = "";
+            my $has_content = 0;
+
+            foreach my $line (@lines) {
+                $line =~ s/^\s*\*?\s*//g;  # remove leading whitespace and optional *
+                $line =~ s/\s*\*\s*$//g;   # remove trailing * and whitespace
+                $line =~ s/\s+$//g;        # remove remaining trailing whitespace
+                if ($line) {  # only process non-empty lines
+                    if ($has_content) {
+                        $converted .= "\n";  # add newline before additional comment lines
+                    }
+                    $converted .= "-- $line";
+                    $has_content = 1;
+                }
+            }
+            $converted;
+        }
+    }gse;
 
     return $sql;
 }
@@ -424,7 +468,7 @@ sub save_to_yaml {
     print $fh "  extracted_at: \"" . scalar(localtime()) . "\"\n";
     print $fh "  total_unique_variables: " . scalar(keys %var_counts) . "\n";
     print $fh "  total_assignments: " . scalar(@$assignments_ref) . "\n";
-    print $fh "  extractor_version: \"2.3-fixed\"\n";
+    print $fh "  extractor_version: \"2.4-fixed\"\n";
 
     if (@target_variables) {
         print $fh "  filtered_variables:\n";
@@ -466,7 +510,7 @@ sub save_to_yaml {
 }
 
 # Main execution
-print "SQL Variable Extractor v2.3 (Fixed Line Numbers)\n";
+print "SQL Variable Extractor v2.4 (Fixed Line Numbers + Comment Conversion)\n";
 print "Analyzing: $input_file\n";
 
 # Extract all SQL variable assignments
