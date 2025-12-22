@@ -84,6 +84,7 @@ sub extract_sql_variables_multi {
 
     # Pattern to match ALL variable assignments with SQL
     # This captures both 'my $var =' and '$var =' patterns
+    # Updated to properly handle Perl string variable definitions that MUST end with semicolon
     my $var_assignment_pattern = qr/
         (?:^|\n|\;)\s*              # Start of line or after statement
         (?:my\s+)?                  # Optional 'my' declaration
@@ -114,68 +115,108 @@ sub extract_sql_variables_multi {
             ((?:[^\\)]|\\.)*?)      # SQL content (capture group 8)
             \)
         )
-        \s*;?                       # Optional semicolon
+        \s*;                        # REQUIRED semicolon - Perl string variables must end with ;
     /xms;
 
-    # Find ALL variable assignments by searching through original content line by line
+    # Find ALL variable assignments by searching through original content
+    # Handle multi-line Perl string assignments that end with semicolon
     my @original_lines = split /\n/, $content;
+    my $i = 0;
 
-    for my $line_num (1 .. @original_lines) {
-        my $line = $original_lines[$line_num - 1];
+    while ($i < @original_lines) {
+        my $line_num = $i + 1;
+        my $line = $original_lines[$i];
 
         # Skip comment lines
-        next if $line =~ /^\s*#/;
-        next if $line =~ /^\s*\/\//;
+        if ($line =~ /^\s*#/ || $line =~ /^\s*\/\//) {
+            $i++;
+            next;
+        }
 
-        # Check if this line contains a variable assignment with SQL
-        if ($line =~ /$var_assignment_pattern/) {
+        # Check if this line starts a variable assignment with potential SQL
+        if ($line =~ /^\s*(?:my\s+)?(\$\w+)\s*=\s*/) {
             my $var_name = $1;
-            my $quote_char = $2;
-            my $sql_content = $3 || $4 || $5 || $6 || $7 || $8 || '';
+            my $assignment_start_line = $line_num;
 
-            # Skip if no SQL content
-            next unless $sql_content;
+            # Collect the complete Perl statement until semicolon
+            my $complete_statement = $line;
+            my $j = $i;
 
-            # Check if it looks like SQL (more comprehensive check)
-            next unless $sql_content =~ /\b(?:SELECT|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|TRUNCATE|GRANT|REVOKE|WITH|BEGIN|COMMIT|ROLLBACK|CALL|EXECUTE|SHOW|DESCRIBE|EXPLAIN)\b/i;
+            # Keep reading lines until we find the statement-ending semicolon
+            while ($j < @original_lines && $complete_statement !~ /;\s*$/) {
+                $j++;
+                last if $j >= @original_lines;
+                my $next_line = $original_lines[$j];
 
-            # For multi-line assignments, we need to capture the full SQL
-            my $full_sql = $sql_content;
+                # Stop if we hit another variable assignment
+                last if $next_line =~ /^\s*(?:my\s+)?\$\w+\s*=/;
 
-            # If the SQL seems incomplete (no semicolon and looks cut off), try to get more lines
-            if ($sql_content !~ /;\s*$/ && $sql_content !~ /\b(?:FROM|WHERE|ORDER|GROUP|HAVING|LIMIT)\b/i && length($sql_content) > 50) {
-                # Look at next few lines to complete the SQL
-                for my $next_line_idx ($line_num .. min($line_num + 10, @original_lines)) {
-                    my $next_line = $original_lines[$next_line_idx - 1] || "";
-                    last if $next_line =~ /^\s*\$\w+/;  # Stop at next variable assignment
-                    last if $next_line =~ /;\s*$/;       # Stop at semicolon
-                    if ($next_line =~ /^\s*"([^"]*)"/) {
-                        $full_sql .= " " . $1;
-                        last if $1 =~ /;\s*$/;
+                # Add the next line to complete statement
+                $complete_statement .= "\n" . $next_line;
+            }
+
+            # Now check if the complete statement matches our SQL pattern
+            if ($complete_statement =~ /$var_assignment_pattern/s) {
+                my $captured_var = $1;
+                my $quote_char = $2;
+                my $sql_content = $3 || $4 || $5 || $6 || $7 || $8 || '';
+
+                # Skip if no SQL content
+                if ($sql_content) {
+                    # Check if it looks like SQL (more comprehensive check)
+                    if ($sql_content =~ /\b(?:SELECT|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|TRUNCATE|GRANT|REVOKE|WITH|BEGIN|COMMIT|ROLLBACK|CALL|EXECUTE|SHOW|DESCRIBE|EXPLAIN)\b/i) {
+
+                        # For Perl concatenated strings, extract all quoted parts
+                        my $full_sql = '';
+
+                        # Handle concatenated strings with . operator
+                        while ($complete_statement =~ /(["'`])((?:[^\\]|\\.)*?)\1/g) {
+                            $full_sql .= $2 . " ";
+                        }
+
+                        # Also handle q{}, qq{}, q(), qq() quoted sections
+                        while ($complete_statement =~ /qq?\{((?:[^\\}]|\\.)*?)\}/g) {
+                            $full_sql .= $1 . " ";
+                        }
+                        while ($complete_statement =~ /qq?\(((?:[^\\)]|\\.)*?)\)/g) {
+                            $full_sql .= $1 . " ";
+                        }
+                        while ($complete_statement =~ /qq?\[((?:[^\\]]|\\.)*?)\]/g) {
+                            $full_sql .= $1 . " ";
+                        }
+
+                        # Clean up the SQL
+                        $full_sql = $sql_content if !$full_sql; # Fallback to original content
+                        $full_sql =~ s/^\s+|\s+$//g; # Trim whitespace
+
+                        # Clean and format SQL
+                        my $cleaned_sql = clean_and_format_sql($full_sql);
+                        my $sql_type = detect_sql_type($cleaned_sql);
+
+                        # Create unique identifier for this assignment
+                        my $base_var_name = $captured_var;
+                        $base_var_name =~ s/^\$//; # Remove $ prefix for cleaner names
+                        my $unique_id = sprintf("%s_line_%d", $base_var_name, $assignment_start_line);
+
+                        # Store assignment info with unique identifier
+                        push @found_assignments, {
+                            unique_id => $unique_id,
+                            variable_name => $base_var_name,
+                            original_var => $captured_var,
+                            sql => $cleaned_sql,
+                            type => $sql_type,
+                            line_number => $assignment_start_line,
+                            quote_style => $quote_char || 'special',
+                            assignment_number => count_previous_assignments(\@found_assignments, $base_var_name) + 1,
+                        };
                     }
                 }
             }
 
-            # Clean and format SQL
-            my $cleaned_sql = clean_and_format_sql($full_sql);
-            my $sql_type = detect_sql_type($cleaned_sql);
-
-            # Create unique identifier for this assignment
-            my $base_var_name = $var_name;
-            $base_var_name =~ s/^\$//; # Remove $ prefix for cleaner names
-            my $unique_id = sprintf("%s_line_%d", $base_var_name, $line_num);
-
-            # Store assignment info with unique identifier
-            push @found_assignments, {
-                unique_id => $unique_id,
-                variable_name => $base_var_name,
-                original_var => $var_name,
-                sql => $cleaned_sql,
-                type => $sql_type,
-                line_number => $line_num,
-                quote_style => $quote_char || 'special',
-                assignment_number => count_previous_assignments(\@found_assignments, $base_var_name) + 1,
-            };
+            # Move past the complete statement
+            $i = $j;
+        } else {
+            $i++;
         }
     }
 
