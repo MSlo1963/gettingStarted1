@@ -1,6 +1,6 @@
 #!/bin/bash
 
-echo "Removing -- comments from .pl files..."
+echo "Removing empty lines from .pl files..."
 echo "----------------------------------------"
 
 processed=0
@@ -11,7 +11,7 @@ for file in *.pl; do
     fi
     
     echo "Processing: $file"
-    sed -i 's/--.*$//' "$file"
+    sed -i '/^[[:space:]]*$/d' "$file"
     ((processed++))
 done
 
