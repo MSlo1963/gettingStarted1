@@ -1,5 +1,22 @@
-grep -E '\$sybase\s*->\s*query\s*\(' your_script.pl | \
-awk -F'query\\(' '{
+#!/bin/bash
+
+# Check if method name is provided
+if [ $# -eq 0 ]; then
+    echo "Usage: $0 <method_name> [script_file]"
+    echo "Example: $0 query my_script.pl"
+    echo "Example: $0 do_query my_script.pl"
+    exit 1
+fi
+
+METHOD="$1"
+SCRIPT_FILE="${2:-*.pl}"  # Default to all .pl files if not specified
+
+echo "Extracting parameters for method: $METHOD"
+echo "From file(s): $SCRIPT_FILE"
+echo "----------------------------------------"
+
+grep -E "\\\$sybase\\s*->\\s*${METHOD}\\s*\\(" $SCRIPT_FILE | \
+awk -F"${METHOD}\\\\(" '{
     for(i=2; i<=NF; i++) {
         # Extract everything until the matching closing parenthesis
         content = $i
