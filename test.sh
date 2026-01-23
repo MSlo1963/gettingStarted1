@@ -1,48 +1,63 @@
-#!/bin/bash
+#!/usr/bin/awk -f
 
-extract_sql() {
-    local file="$1"
-    local id="$2"
-    local temp_file=$(mktemp)
-    
-    # Find the block for our ID and extract it
-    awk -v target="$id" '
-    BEGIN { found=0; printing=0 }
-    /^[[:space:]]*-[[:space:]]*id:/ { 
-        if ($0 ~ target) { 
-            found=1; printing=1 
-        } else { 
-            printing=0 
-        } 
+BEGIN {
+    if (target_id == "") {
+        print "Usage: awk -f extract_sql.awk -v target_id=<id> <yaml_file>"
+        exit 1
     }
-    /^[[:space:]]*-[[:space:]]*id:/ && printing && found && $0 !~ target { 
-        printing=0 
-    }
-    printing { print }
-    ' "$file" > "$temp_file"
-    
-    # Extract just the SQL part
-    if [[ -s "$temp_file" ]]; then
-        # Find sql line and extract everything after it that's indented
-        grep -A 1000 "sql:[[:space:]]*|" "$temp_file" | \
-        tail -n +2 | \
-        while read -r line; do
-            if [[ "$line" =~ ^[[:space:]]+.+ ]]; then
-                echo "$line" | sed 's/^[[:space:]]*//'
-            elif [[ "$line" =~ ^[[:space:]]*$ ]]; then
-                echo ""
-            else
-                break
-            fi
-        done
-    else
-        echo "No SQL found for id: $id" >&2
-        rm "$temp_file"
-        return 1
-    fi
-    
-    rm "$temp_file"
+    found_id = 0
+    in_sql = 0
+    sql_content = ""
 }
 
-# Usage
-extract_sql "$1" "$2"
+# Look for exact id match
+/^[[:space:]]*id:[[:space:]]*/ {
+    # Extract the id value
+    gsub(/^[[:space:]]*id:[[:space:]]*/, "")
+    gsub(/[[:space:]]*$/, "")
+    
+    if ($0 == target_id) {
+        found_id = 1
+        in_sql = 0
+    } else {
+        found_id = 0
+        in_sql = 0
+    }
+    next
+}
+
+# If we found our target id, look for sql block
+/^[[:space:]]*sql:[[:space:]]*\|[\-]?[[:space:]]*$/ && found_id {
+    in_sql = 1
+    next
+}
+
+# Collect SQL content when in sql block
+in_sql && found_id {
+    if (/^[[:space:]]+/) {
+        # Remove base indentation and collect
+        gsub(/^[[:space:]]+/, "")
+        if (sql_content == "") {
+            sql_content = $0
+        } else {
+            sql_content = sql_content "\n" $0
+        }
+    } else if (/^[[:space:]]*$/) {
+        # Empty line in SQL block
+        if (sql_content != "") {
+            sql_content = sql_content "\n"
+        }
+    } else if (/^[[:space:]]*[a-zA-Z_]+:[[:space:]]*/) {
+        # Hit another field, end of SQL
+        in_sql = 0
+    }
+}
+
+END {
+    if (sql_content != "") {
+        print sql_content
+    } else {
+        print "No SQL found for id: " target_id > "/dev/stderr"
+        exit 1
+    }
+}
