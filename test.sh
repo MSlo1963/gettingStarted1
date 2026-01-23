@@ -1,42 +1,48 @@
 #!/bin/bash
 
-get_sql_by_id() {
-    local file_path="$1"
-    local target_id="$2"
+extract_sql() {
+    local file="$1"
+    local id="$2"
+    local temp_file=$(mktemp)
     
-    if [[ ! -f "$file_path" ]]; then
-        echo "Error: File '$file_path' not found" >&2
+    # Find the block for our ID and extract it
+    awk -v target="$id" '
+    BEGIN { found=0; printing=0 }
+    /^[[:space:]]*-[[:space:]]*id:/ { 
+        if ($0 ~ target) { 
+            found=1; printing=1 
+        } else { 
+            printing=0 
+        } 
+    }
+    /^[[:space:]]*-[[:space:]]*id:/ && printing && found && $0 !~ target { 
+        printing=0 
+    }
+    printing { print }
+    ' "$file" > "$temp_file"
+    
+    # Extract just the SQL part
+    if [[ -s "$temp_file" ]]; then
+        # Find sql line and extract everything after it that's indented
+        grep -A 1000 "sql:[[:space:]]*|" "$temp_file" | \
+        tail -n +2 | \
+        while read -r line; do
+            if [[ "$line" =~ ^[[:space:]]+.+ ]]; then
+                echo "$line" | sed 's/^[[:space:]]*//'
+            elif [[ "$line" =~ ^[[:space:]]*$ ]]; then
+                echo ""
+            else
+                break
+            fi
+        done
+    else
+        echo "No SQL found for id: $id" >&2
+        rm "$temp_file"
         return 1
     fi
     
-    # Use yq (YAML processor) if available
-    if command -v yq &> /dev/null; then
-        yq eval ".[] | select(.id == \"$target_id\") | .sql" "$file_path" 2>/dev/null
-    else
-        # Fallback to python
-        python3 -c "
-import yaml, sys
-with open('$file_path', 'r') as f:
-    data = yaml.safe_load(f)
-items = data if isinstance(data, list) else [data]
-for item in items:
-    if isinstance(item, dict) and item.get('id') == '$target_id':
-        print(item.get('sql', ''))
-        break
-"
-    fi
+    rm "$temp_file"
 }
 
 # Usage
-if [[ $# -ne 2 ]]; then
-    echo "Usage: $0 <yaml_file> <id>"
-    exit 1
-fi
-
-sql_content=$(get_sql_by_id "$1" "$2")
-if [[ -n "$sql_content" ]]; then
-    echo "$sql_content"
-else
-    echo "No SQL found for id: $2" >&2
-    exit 1
-fi
+extract_sql "$1" "$2"
