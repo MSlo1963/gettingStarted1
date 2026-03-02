@@ -147,21 +147,29 @@ sub copy_structure {
     die "[ERROR] Table '$src_schema.$table' not found in Sybase source DB.\n" unless @$columns;
 
     # ── Fetch primary key columns ─────────────────────────────────────────────
-    my $pk_sth = $src_dbh->prepare(qq{
-        SELECT c.name
-        FROM $src{dbname}..sysindexes  i
-        JOIN $src{dbname}..sysindexkeys ik ON i.id      = ik.id
-                                          AND i.indid   = ik.indid
-        JOIN $src{dbname}..syscolumns  c  ON ik.id      = c.id
-                                          AND ik.colid  = c.colid
-        WHERE i.id     = OBJECT_ID('$src_schema.$table')
-          AND i.status & 2048 = 2048
-        ORDER BY ik.keyno
+    # sysindexkeys does not exist in Sybase ASE. Instead we use the built-in
+    # index_col(table, indid, key#) function together with sysindexes.keycnt.
+    # For a clustered index on an allpages-locked table keycnt is the exact
+    # number of keys; for all other indexes keycnt = keys + 1, so we stop when
+    # index_col() returns NULL.
+    my $pk_idx_sth = $src_dbh->prepare(qq{
+        SELECT i.indid, i.keycnt
+        FROM   $src{dbname}..sysindexes i
+        WHERE  i.id     = OBJECT_ID('$src_schema.$table')
+          AND  i.status & 2048 = 2048
     });
-    $pk_sth->execute();
+    $pk_idx_sth->execute();
     my @pk_cols;
-    while (my $row = $pk_sth->fetchrow_arrayref()) {
-        push @pk_cols, qq("$row->[0]");
+    while (my $pk_row = $pk_idx_sth->fetchrow_hashref()) {
+        my $indid  = $pk_row->{indid};
+        my $keycnt = $pk_row->{keycnt};
+        for my $keyno (1 .. $keycnt) {
+            my ($col_name) = $src_dbh->selectrow_array(
+                qq{SELECT index_col('$src_schema.$table', $indid, $keyno)}
+            );
+            last unless defined $col_name;
+            push @pk_cols, qq("$col_name");
+        }
     }
 
     # ── Build PostgreSQL CREATE TABLE DDL ────────────────────────────────────
@@ -256,38 +264,45 @@ sub sybase_to_pg_type {
 sub copy_indexes {
     my ($src_dbh, $tgt_dbh, $src_schema, $tgt_schema, $table, $tgt_table) = @_;
 
-    # Fetch non-clustered, non-primary-key indexes from Sybase sysindexes
+    # Fetch non-clustered, non-primary-key indexes from Sybase sysindexes.
+    # sysindexkeys does not exist in Sybase ASE – we use index_col() instead.
     my $idx_sth = $src_dbh->prepare(qq{
         SELECT
-            i.name                              AS index_name,
-            i.status                            AS index_status,
-            c.name                              AS col_name,
-            ik.keyno                            AS key_order
-        FROM $src{dbname}..sysindexes   i
-        JOIN $src{dbname}..sysindexkeys ik ON i.id    = ik.id
-                                          AND i.indid = ik.indid
-        JOIN $src{dbname}..syscolumns   c  ON ik.id   = c.id
-                                          AND ik.colid = c.colid
+            i.name    AS index_name,
+            i.status  AS index_status,
+            i.indid   AS indid,
+            i.keycnt  AS keycnt
+        FROM $src{dbname}..sysindexes i
         WHERE i.id      = OBJECT_ID('$src_schema.$table')
           AND i.indid  >= 1
-          AND i.status & 2048 = 0       -- exclude primary key indexes
-          AND i.status & 32  = 0        -- exclude hypothetical indexes
-        ORDER BY i.name, ik.keyno
+          AND i.indid  <> 255             -- exclude text/image rows
+          AND i.status & 2048 = 0         -- exclude primary key indexes
+          AND i.status & 32   = 0         -- exclude hypothetical indexes
+        ORDER BY i.name
     });
     $idx_sth->execute();
 
-    # Group columns per index
+    # For each index, resolve column names via index_col()
     my %indexes;
     my @index_order;
     while (my $row = $idx_sth->fetchrow_hashref()) {
-        unless (exists $indexes{ $row->{index_name} }) {
-            push @index_order, $row->{index_name};
-            $indexes{ $row->{index_name} } = {
+        my $idx_name = $row->{index_name};
+        my $indid    = $row->{indid};
+        my $keycnt   = $row->{keycnt};
+        unless (exists $indexes{$idx_name}) {
+            push @index_order, $idx_name;
+            $indexes{$idx_name} = {
                 unique  => ($row->{index_status} & 2) ? 1 : 0,
                 columns => [],
             };
         }
-        push @{ $indexes{ $row->{index_name} }{columns} }, $row->{col_name};
+        for my $keyno (1 .. $keycnt) {
+            my ($col_name) = $src_dbh->selectrow_array(
+                qq{SELECT index_col('$src_schema.$table', $indid, $keyno)}
+            );
+            last unless defined $col_name;
+            push @{ $indexes{$idx_name}{columns} }, $col_name;
+        }
     }
 
     my $count = 0;
