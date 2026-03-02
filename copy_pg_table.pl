@@ -25,6 +25,7 @@ my %tgt = (
 );
 
 my $table       = '';
+my $tgt_table   = '';
 my $schema      = 'public';
 my $batch_size  = 1000;
 my $drop_first  = 0;
@@ -44,6 +45,7 @@ GetOptions(
     'tgt-user=s'   => \$tgt{user},
     'tgt-pass=s'   => \$tgt{pass},
     'table=s'      => \$table,
+    'tgt-table=s'  => \$tgt_table,
     'schema=s'     => \$schema,
     'batch=i'      => \$batch_size,
     'drop'         => \$drop_first,
@@ -60,6 +62,9 @@ usage() if $help;
 die "[ERROR] --table is required\n"  unless $table;
 die "[ERROR] --src-db is required\n" unless $src{dbname};
 die "[ERROR] --tgt-db is required\n" unless $tgt{dbname};
+
+# Default target table name to source table name if not specified
+$tgt_table = $table unless $tgt_table;
 
 # ─────────────────────────────────────────────
 #  Connect to both databases
@@ -83,13 +88,13 @@ my $tgt_dbh = DBI->connect(
 # ─────────────────────────────────────────────
 eval {
     unless ($data_only) {
-        copy_structure($src_dbh, $tgt_dbh, $schema, $table);
+        copy_structure($src_dbh, $tgt_dbh, $schema, $table, $tgt_table);
     }
     unless ($struct_only) {
-        copy_data($src_dbh, $tgt_dbh, $schema, $table);
+        copy_data($src_dbh, $tgt_dbh, $schema, $table, $tgt_table);
     }
     $tgt_dbh->commit();
-    log_info("Done. Table '$schema.$table' copied successfully.");
+    log_info("Done. '$schema.$table' copied to '$schema.$tgt_table' successfully.");
 };
 if ($@) {
     log_error("Rolling back due to error: $@");
@@ -105,7 +110,7 @@ $tgt_dbh->disconnect();
 # ─────────────────────────────────────────────
 
 sub copy_structure {
-    my ($src_dbh, $tgt_dbh, $schema, $table) = @_;
+    my ($src_dbh, $tgt_dbh, $schema, $table, $tgt_table) = @_;
     log_info("Reading column definitions for '$schema.$table' ...");
 
     # Fetch column info
@@ -162,20 +167,20 @@ sub copy_structure {
 
     # Drop existing table if requested
     if ($drop_first) {
-        log_info("Dropping existing table '$schema.$table' on target (--drop) ...");
-        $tgt_dbh->do(qq{DROP TABLE IF EXISTS "$schema"."$table" CASCADE});
+        log_info("Dropping existing table '$schema.$tgt_table' on target (--drop) ...");
+        $tgt_dbh->do(qq{DROP TABLE IF EXISTS "$schema"."$tgt_table" CASCADE});
     }
 
-    my $ddl = qq{CREATE TABLE IF NOT EXISTS "$schema"."$table" (\n}
+    my $ddl = qq{CREATE TABLE IF NOT EXISTS "$schema"."$tgt_table" (\n}
             . join(",\n", @col_defs)
             . "\n)";
 
-    log_info("Creating table on target ...");
+    log_info("Creating table '$schema.$tgt_table' on target ...");
     log_debug($ddl);
     $tgt_dbh->do($ddl);
 
     # Copy indexes (non-PK)
-    copy_indexes($src_dbh, $tgt_dbh, $schema, $table);
+    copy_indexes($src_dbh, $tgt_dbh, $schema, $table, $tgt_table);
 
     $tgt_dbh->commit();
     log_info("Structure copied.");
@@ -187,7 +192,7 @@ sub resolve_type {
 
     # Prefer udt_name for arrays / custom / enum types
     if ($dtype eq 'array') {
-        return "$col->{udt_name}[]";
+        return $col->{udt_name} . '[]';
     }
     if ($dtype eq 'user-defined') {
         return $col->{udt_name};
@@ -209,7 +214,7 @@ sub resolve_type {
 }
 
 sub copy_indexes {
-    my ($src_dbh, $tgt_dbh, $schema, $table) = @_;
+    my ($src_dbh, $tgt_dbh, $schema, $table, $tgt_table) = @_;
 
     my $idx_sth = $src_dbh->prepare(q{
         SELECT indexdef
@@ -228,6 +233,16 @@ sub copy_indexes {
 
     my $count = 0;
     while (my ($indexdef) = $idx_sth->fetchrow_array()) {
+        # Rewrite the index DDL to reference the target table name if it differs
+        if ($tgt_table ne $table) {
+            # Use /e so the replacement is an expression – this way literal $ signs
+            # inside $schema / $tgt_table are never re-interpolated as Perl variables.
+            my ($q_schema, $q_tgt) = (quotemeta($schema), quotemeta($tgt_table));
+            $indexdef =~ s/\bON\s+\Q$schema\E\.\Q$table\E\b/"ON \"$schema\".\"$tgt_table\""/ie;
+            $indexdef =~ s/\bON\s+\Q$table\E\b/"ON \"$tgt_table\""/ie;
+            # Rename the index itself to avoid conflicts; /e builds the string safely
+            $indexdef =~ s/\bINDEX\s+(\S+)/"INDEX $1\_$tgt_table"/ie;
+        }
         eval { $tgt_dbh->do($indexdef) };
         if ($@) {
             log_warn("Could not create index (may already exist): $@");
@@ -239,13 +254,13 @@ sub copy_indexes {
 }
 
 sub copy_data {
-    my ($src_dbh, $tgt_dbh, $schema, $table) = @_;
+    my ($src_dbh, $tgt_dbh, $schema, $table, $tgt_table) = @_;
 
     # Count rows
     my ($total) = $src_dbh->selectrow_array(
         qq{SELECT COUNT(*) FROM "$schema"."$table"}
     );
-    log_info("Copying $total row(s) in batches of $batch_size ...");
+    log_info("Copying $total row(s) from '$schema.$table' to '$schema.$tgt_table' in batches of $batch_size ...");
 
     return if $total == 0;
 
@@ -263,7 +278,7 @@ sub copy_data {
     my $ph_list   = join(', ', ('?') x scalar @col_names);
 
     my $select_sql = qq{SELECT $col_list FROM "$schema"."$table"};
-    my $insert_sql = qq{INSERT INTO "$schema"."$table" ($col_list) VALUES ($ph_list)
+    my $insert_sql = qq{INSERT INTO "$schema"."$tgt_table" ($col_list) VALUES ($ph_list)
                         ON CONFLICT DO NOTHING};
 
     my $sel_sth = $src_dbh->prepare($select_sql);
@@ -313,8 +328,15 @@ sub usage {
     print <<'END';
 Usage: perl copy_pg_table.pl [OPTIONS]
 
+NOTE: If a table name contains dollar signs (e.g. data$foo$bar), you MUST
+single-quote the value on the command line so the shell does not expand $foo
+as a variable:
+  --table='data$foo$bar'          (correct  – shell passes literal $)
+  --table="data$foo$bar"          (WRONG    – shell strips $foo and $bar)
+
 Required:
-  --table=NAME        Table name to copy
+  --table=NAME        Source table name to copy (single-quote if name contains $)
+  --tgt-table=NAME    Target table name (default: same as --table)
   --src-db=NAME       Source database name
   --tgt-db=NAME       Target database name
 
@@ -331,7 +353,7 @@ Target connection (defaults: localhost:5432, user=postgres):
   --tgt-pass=PASS
 
 Options:
-  --schema=NAME       Schema name (default: public)
+  --schema=NAME       Schema name for both source and target (default: public)
   --batch=N           Insert batch size (default: 1000)
   --drop              DROP the target table before creating it
   --data-only         Copy data only (skip CREATE TABLE)
@@ -339,17 +361,27 @@ Options:
   --help              Show this help
 
 Examples:
-  # Full copy (structure + data) on the same server
+  # Full copy (structure + data) on the same server, same table name
   perl copy_pg_table.pl --src-db=mydb --tgt-db=newdb --table=orders
 
-  # Cross-server copy
+  # Table name containing $ signs – single-quote the value!
+  perl copy_pg_table.pl --src-db=mydb --tgt-db=newdb --table='data$mytable$xyz'
+
+  # Copy to a differently named target table
+  perl copy_pg_table.pl --src-db=mydb --tgt-db=newdb --table=orders --tgt-table=orders_archive
+
+  # Copy a $-named table to a plain target name
+  perl copy_pg_table.pl --src-db=mydb --tgt-db=newdb \
+    --table='data$mytable$xyz' --tgt-table=data_mytable_xyz
+
+  # Cross-server copy with a renamed target table
   perl copy_pg_table.pl \
     --src-host=db1.example.com --src-db=prod --src-user=admin --src-pass=secret \
     --tgt-host=db2.example.com --tgt-db=staging --tgt-user=admin --tgt-pass=secret \
-    --table=customers --schema=sales --batch=500
+    --table=customers --tgt-table=customers_staging --schema=sales --batch=500
 
   # Re-create table from scratch and copy data
-  perl copy_pg_table.pl --src-db=mydb --tgt-db=newdb --table=orders --drop
+  perl copy_pg_table.pl --src-db=mydb --tgt-db=newdb --table=orders --tgt-table=orders_v2 --drop
 
 END
     exit 0;
