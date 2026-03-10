@@ -140,8 +140,43 @@ sub copy_structure {
     });
     $col_sth->execute();
     my $columns = $col_sth->fetchall_arrayref({});
-    die "[ERROR] Table '$src_schema.$table' not found in source Sybase DB '$src{dbname}'.\n"
+    die "[ERROR] Table '$src_schema.$table' not found in Sybase DB '$src{dbname}'.\n"
         unless @$columns;
+
+    # ── Debug: dump raw status byte for every column ──────────────────────────
+    log_debug("Raw syscolumns.status dump for '$src_schema.$table':");
+    for my $col (@$columns) {
+        my $status  = $col->{col_status} // 'undef';
+        my $null_bit = (defined $col->{col_status}) ? ($col->{col_status} & 8) : '?';
+        log_debug(sprintf("  %-30s  status=%-4s  bit8(null)=%s  is_identity=%s",
+            $col->{column_name},
+            $status,
+            $null_bit ? 'NULLABLE' : 'NOT NULL',
+            $col->{is_identity} ? 'YES' : 'no',
+        ));
+    }
+
+    # ── Cross-check: also read nullability from information_schema ────────────
+    # syscolumns.status can be unreliable across ASE versions / FreeTDS drivers.
+    # information_schema.columns.is_nullable is a plain YES/NO string – safer.
+    my %is_nullable;
+    eval {
+        my $is_sth = $src_dbh->prepare(qq{
+            SELECT column_name, is_nullable
+            FROM   $src{dbname}..information_schema.columns
+            WHERE  table_schema = '$src_schema'
+              AND  table_name   = '$table'
+        });
+        $is_sth->execute();
+        while (my $r = $is_sth->fetchrow_hashref()) {
+            $is_nullable{ $r->{column_name} } = ($r->{is_nullable} eq 'YES') ? 1 : 0;
+        }
+        log_debug("information_schema nullability loaded for "
+                . scalar(keys %is_nullable) . " column(s).");
+    };
+    if ($@) {
+        log_warn("Could not read information_schema.columns (will fall back to syscolumns.status bit 8): $@");
+    }
 
     # ── Fetch default values from syscomments ────────────────────────────────
     # cdefault holds the id of the default object; look up the actual text
@@ -224,8 +259,16 @@ sub copy_structure {
         }
 
         # NULL / NOT NULL
-        # status bit 8 (bit 3) = nulls ARE allowed  (per Sybase ASE syscolumns docs)
-        my $nullable = ($col->{col_status} & 8) ? ' NULL' : ' NOT NULL';
+        # Prefer information_schema.columns (plain YES/NO, driver-independent).
+        # Fall back to syscolumns.status bit 8 if information_schema was not available.
+        my $col_nullable;
+        if (exists $is_nullable{$name}) {
+            $col_nullable = $is_nullable{$name} ? ' NULL' : ' NOT NULL';
+        } else {
+            # status bit 8 (bit 3) = nulls ARE allowed (per Sybase ASE syscolumns docs)
+            $col_nullable = ($col->{col_status} & 8) ? ' NULL' : ' NOT NULL';
+        }
+        my $nullable = $col_nullable;
 
         # DEFAULT value (if any)
         my $default = '';
@@ -236,11 +279,8 @@ sub copy_structure {
         push @col_defs, "    $name $type$default$nullable";
     }
 
-    # Primary key constraint inline
-    if (@pk_cols) {
-        my $pk_col_list = join(', ', @pk_cols);
-        push @col_defs, "    PRIMARY KEY ($pk_col_list)";
-    }
+    # NOTE: Sybase ASE does not support inline PRIMARY KEY in CREATE TABLE.
+    # The PK will be created as a separate UNIQUE CLUSTERED INDEX after the table.
 
     # ── Drop existing table on target if requested ────────────────────────────
     if ($drop_first) {
@@ -261,6 +301,21 @@ sub copy_structure {
     eval { $tgt_dbh->do($ddl) };
     if ($@) {
         die "[ERROR] Could not create table '$tgt_schema.$tgt_table': $@\n";
+    }
+
+    # ── Create primary key as a separate UNIQUE CLUSTERED INDEX ──────────────
+    # Sybase ASE requires the PK to be a named index, not an inline constraint.
+    if (@pk_cols) {
+        my $pk_col_list = join(', ', @pk_cols);
+        my $pk_idx_name = "pk_${tgt_table}";
+        my $pk_ddl      = "CREATE UNIQUE CLUSTERED INDEX $pk_idx_name "
+                        . "ON $tgt_schema.$tgt_table ($pk_col_list)";
+        log_info("Creating primary key index '$pk_idx_name' ...");
+        log_debug($pk_ddl);
+        eval { $tgt_dbh->do($pk_ddl) };
+        if ($@) {
+            log_warn("Could not create primary key index '$pk_idx_name': $@");
+        }
     }
 
     # ── Copy non-PK indexes ───────────────────────────────────────────────────
