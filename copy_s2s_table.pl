@@ -130,7 +130,7 @@ sub copy_structure {
             c.scale                             AS col_scale,
             c.status                            AS col_status,
             c.colid                             AS col_order,
-            CASE WHEN c.status & 16 = 16
+            CASE WHEN c.status & 128 = 128
                  THEN 1 ELSE 0 END              AS is_identity,
             c.cdefault                          AS default_id
         FROM $src{dbname}..syscolumns c
@@ -212,8 +212,8 @@ sub copy_structure {
         }
 
         # NULL / NOT NULL
-        # status bit 0x01 = nulls ARE allowed
-        my $nullable = ($col->{col_status} & 1) ? ' NULL' : ' NOT NULL';
+        # status bit 8 (bit 3) = nulls ARE allowed  (per Sybase ASE syscolumns docs)
+        my $nullable = ($col->{col_status} & 8) ? ' NULL' : ' NOT NULL';
 
         # DEFAULT value (if any)
         my $default = '';
@@ -445,7 +445,7 @@ sub copy_data {
         SELECT count(*)
         FROM   $src{dbname}..syscolumns
         WHERE  id     = OBJECT_ID('$src_schema.$table')
-          AND  status & 16 = 16
+          AND  status & 128 = 128
     });
 
     my $col_list   = join(', ', @all_cols);
