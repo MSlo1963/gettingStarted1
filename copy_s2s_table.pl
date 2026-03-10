@@ -202,6 +202,15 @@ sub copy_structure {
             next;
         }
 
+        # TIMESTAMP columns – Sybase manages this as a binary row-version counter.
+        # No DEFAULT and no explicit NULL/NOT NULL – just declare the type and let
+        # Sybase handle everything.  Data copy skips these columns entirely.
+        if (lc($type) eq 'timestamp') {
+            log_info("  Column '$name' is timestamp – declared as-is, will be skipped during data copy.");
+            push @col_defs, "    $name timestamp NOT NULL";
+            next;
+        }
+
         # NULL / NOT NULL
         # status bit 0x01 = nulls ARE allowed
         my $nullable = ($col->{col_status} & 1) ? ' NULL' : ' NOT NULL';
@@ -391,15 +400,45 @@ sub copy_data {
 
     return if $total == 0;
 
-    # Fetch column names in ordinal order
+    # ── Fetch column names and types in ordinal order ─────────────────────────
+    # timestamp columns are EXCLUDED: Sybase manages them automatically as a
+    # binary row-version counter.  A user cannot insert into a timestamp column
+    # ("a non-null value cannot be inserted into a timestamp column by the user").
+    # We cannot use ? placeholders with Sybase/FreeTDS for a prepared INSERT
+    # because the server cannot resolve the parameter marker types at prepare
+    # time. Instead we build a complete literal INSERT string per row, with
+    # every value formatted according to its Sybase data type.
     my $col_sth = $src_dbh->prepare(qq{
-        SELECT c.name
+        SELECT c.name      AS column_name,
+               t.name      AS type_name
         FROM   $src{dbname}..syscolumns c
+        JOIN   $src{dbname}..systypes   t ON c.usertype = t.usertype
         WHERE  c.id = OBJECT_ID('$src_schema.$table')
+          AND  t.name <> 'timestamp'          -- exclude timestamp: server-managed
         ORDER  BY c.colid
     });
     $col_sth->execute();
-    my @all_cols   = map { $_->[0] } @{ $col_sth->fetchall_arrayref() };
+
+    my (@all_cols, @col_types);
+    while (my $r = $col_sth->fetchrow_hashref()) {
+        push @all_cols,  $r->{column_name};
+        push @col_types, lc($r->{type_name});
+    }
+
+    if (@all_cols < 1) {
+        die "[ERROR] No copyable columns found in '$src_schema.$table'.\n";
+    }
+
+    # Log any timestamp columns that were skipped
+    my ($ts_count) = $src_dbh->selectrow_array(qq{
+        SELECT count(*)
+        FROM   $src{dbname}..syscolumns c
+        JOIN   $src{dbname}..systypes   t ON c.usertype = t.usertype
+        WHERE  c.id    = OBJECT_ID('$src_schema.$table')
+          AND  t.name  = 'timestamp'
+    });
+    log_info("Skipping $ts_count timestamp column(s) – Sybase assigns these automatically.")
+        if $ts_count;
 
     # Detect identity columns – we need SET IDENTITY_INSERT ON for those
     my ($has_identity) = $src_dbh->selectrow_array(qq{
@@ -409,14 +448,10 @@ sub copy_data {
           AND  status & 16 = 16
     });
 
-    my $col_list = join(', ', @all_cols);
-    my $ph_list  = join(', ', ('?') x scalar @all_cols);
-
+    my $col_list   = join(', ', @all_cols);
     my $select_sql = "SELECT $col_list FROM $src_schema.$table";
-    my $insert_sql = "INSERT INTO $tgt_schema.$tgt_table ($col_list) VALUES ($ph_list)";
 
     log_debug("SELECT: $select_sql");
-    log_debug("INSERT: $insert_sql");
 
     # Allow inserting into identity columns on the target
     if ($has_identity) {
@@ -425,9 +460,9 @@ sub copy_data {
         log_warn("Could not set IDENTITY_INSERT: $@") if $@;
     }
 
-    my $sel_sth = $src_dbh->prepare($select_sql);
-    my $ins_sth = $tgt_dbh->prepare($insert_sql);
+    my $insert_prefix = "INSERT INTO $tgt_schema.$tgt_table ($col_list) VALUES ";
 
+    my $sel_sth = $src_dbh->prepare($select_sql);
     $sel_sth->execute();
 
     my $inserted = 0;
@@ -437,13 +472,15 @@ sub copy_data {
     while (my $row = $sel_sth->fetchrow_arrayref()) {
         push @batch, [@$row];
         if (@batch >= $batch_size) {
-            flush_batch($ins_sth, \@batch, \$inserted, \$skipped);
+            flush_batch($tgt_dbh, $insert_prefix, \@batch, \@col_types,
+                        \$inserted, \$skipped);
             @batch = ();
             log_info(sprintf("  Progress: %d / %d rows (%.1f%%)",
                 $inserted, $total, ($inserted / $total) * 100));
         }
     }
-    flush_batch($ins_sth, \@batch, \$inserted, \$skipped) if @batch;
+    flush_batch($tgt_dbh, $insert_prefix, \@batch, \@col_types,
+                \$inserted, \$skipped) if @batch;
 
     # Turn identity insert off again
     if ($has_identity) {
@@ -453,13 +490,52 @@ sub copy_data {
     log_info("Data copy complete: $inserted row(s) inserted, $skipped skipped (duplicates/errors).");
 }
 
+# ─────────────────────────────────────────────
+#  Quote a single value for inline Sybase SQL
+# ─────────────────────────────────────────────
+sub quote_value {
+    my ($val, $type) = @_;
+
+    # NULL is always NULL regardless of type
+    return 'NULL' unless defined $val;
+
+    # ── Numeric types – no quoting ────────────────────────────────────────────
+    if ($type =~ /^(tinyint|smallint|int|bigint|float|real|double|
+                     numeric|decimal|money|smallmoney|bit)$/x) {
+        # Sanitise: keep only digits, sign, dot, exponent
+        (my $safe = $val) =~ s/[^0-9+\-\.eE]//g;
+        return $safe;
+    }
+
+    # ── Binary / image – hex literal ─────────────────────────────────────────
+    if ($type =~ /^(binary|varbinary|image)$/) {
+        return '0x' . unpack('H*', $val);
+    }
+
+    # ── Timestamp – stored as binary in Sybase ────────────────────────────────
+    if ($type eq 'timestamp') {
+        return '0x' . unpack('H*', $val);
+    }
+
+    # ── All other types (varchar, char, text, datetime, etc.) – quoted string ─
+    # Escape any single quotes inside the value by doubling them
+    $val =~ s/'/''/g;
+    return "'$val'";
+}
+
 sub flush_batch {
-    my ($ins_sth, $batch, $inserted_ref, $skipped_ref) = @_;
+    my ($tgt_dbh, $insert_prefix, $batch, $col_types, $inserted_ref, $skipped_ref) = @_;
     for my $row (@$batch) {
-        eval { $ins_sth->execute(@$row) };
+        my $values = join(', ', map {
+            quote_value($row->[$_], $col_types->[$_])
+        } 0 .. $#$row);
+
+        my $sql = $insert_prefix . "($values)";
+        eval { $tgt_dbh->do($sql) };
         if ($@) {
             $$skipped_ref++;
             log_warn("Row skipped: $@");
+            log_debug("Failed SQL: $sql");
         } else {
             $$inserted_ref++;
         }
@@ -479,7 +555,7 @@ sub log_debug { print "[DEBUG] $_[0]\n" }
 # ─────────────────────────────────────────────
 sub usage {
     print <<'END';
-Usage: perl copy_sybase_to_sybase.pl [OPTIONS]
+Usage: perl copy_2s2_table.pl [OPTIONS]
 
 Copies a table from one Sybase ASE database to another Sybase ASE database.
 Schema structure (columns, identity, defaults, primary key, indexes) is
@@ -525,29 +601,29 @@ What is NOT copied:
 
 Examples:
   # Full copy on the same server, different database
-  perl copy_sybase_to_sybase.pl \
+  perl copy_2s2_table.pl \
     --src-db=PROD --tgt-db=STAGING --table=orders
 
   # Different servers, different table name
-  perl copy_sybase_to_sybase.pl \
+  perl copy_2s2_table.pl \
     --src-host=ase1 --src-db=PROD   --src-user=sa --src-pass=secret \
     --tgt-host=ase2 --tgt-db=ARCHIV --tgt-user=sa --tgt-pass=secret \
     --table=orders --tgt-table=orders_2024
 
   # Structure only – inspect DDL before copying data
-  perl copy_sybase_to_sybase.pl \
+  perl copy_2s2_table.pl \
     --src-db=PROD --tgt-db=STAGING --table=orders --struct-only
 
   # Re-create from scratch and copy data
-  perl copy_sybase_to_sybase.pl \
+  perl copy_2s2_table.pl \
     --src-db=PROD --tgt-db=STAGING --table=orders --drop
 
   # Data only – target table already exists
-  perl copy_sybase_to_sybase.pl \
+  perl copy_2s2_table.pl \
     --src-db=PROD --tgt-db=STAGING --table=orders --data-only --batch=5000
 
   # Different schema/owner on target
-  perl copy_sybase_to_sybase.pl \
+  perl copy_2s2_table.pl \
     --src-db=PROD --src-schema=sales \
     --tgt-db=STAGING --tgt-schema=dbo \
     --table=customers --tgt-table=customers_staging
