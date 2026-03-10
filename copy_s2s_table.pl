@@ -190,14 +190,26 @@ sub copy_structure {
         my $type    = sybase_native_type($col);
 
         # IDENTITY columns
+        # ident_seed() / ident_incr() are not available on all ASE versions.
+        # Instead we read the current maximum value from the source table and
+        # use that as the seed so the target picks up where the source left off.
+        # The increment is almost always 1 in practice; we default to 1.
         if ($col->{is_identity}) {
-            # Fetch the identity seed and increment from the source
-            my ($seed, $incr) = $src_dbh->selectrow_array(qq{
-                SELECT ident_seed('$src_schema.$table'),
-                       ident_incr('$src_schema.$table')
-            });
-            $seed //= 1;
-            $incr //= 1;
+            my $seed = 1;
+            my $incr = 1;
+
+            # Try to get the current max identity value from the data
+            eval {
+                my ($max_val) = $src_dbh->selectrow_array(
+                    qq{SELECT max($name) FROM $src_schema.$table}
+                );
+                $seed = $max_val + 1 if defined $max_val && $max_val =~ /^\d+$/;
+            };
+            if ($@) {
+                log_warn("Could not read max identity value for '$name', defaulting seed to 1: $@");
+                $seed = 1;
+            }
+
             push @col_defs, "    $name $type IDENTITY($seed,$incr) NOT NULL";
             next;
         }
