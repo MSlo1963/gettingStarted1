@@ -8,20 +8,32 @@ use Getopt::Long;
 # ---------------------------------------------------------------------------
 # migrate_sybase_to_db.pl
 #
-# Detects and rewrites:
+# Detects and rewrites the pattern:
 #
-#   unless ($sybase = Mx::Sybase2->new( ... )) { ... }   (single or multiline)
-#   unless ($sybase = Mx::Sybase->new(  ... )) { ... }   (single or multiline)
+#   unless ($sybase = Mx::Sybase2->new(
+#       ...
+#       database => 'KBC_MXDBREP',   # or KBC_MXDB
+#       ...
+#   )) {
+#       <failure block>
+#   }
 #
-# into:
+# Rules:
+#   - argument list contains 'KBC_MXDBREP'  =>  db_role => 'REP'
+#   - argument list contains 'KBC_MXDB'     =>  db_role => 'FIN'
+#     (KBC_MXDBREP is tested first since it contains KBC_MXDB as a substring)
 #
-#   unless ($sybase = Mx::DB->new( ... )) { ... }
+# Rewritten to:
+#
+#   my $db = Mx::DB->new( config => $config, logger => $logger,
+#                         auto_account => 1, db_role => 'REP' );
+#   unless ($db) {
+#       <failure block>
+#   }
 #
 # Also rewrites:
-#   use Mx::Sybase2       =>  use Mx::DB
-#   use Mx::Sybase        =>  use Mx::DB
-#   Mx::Sybase2->method   =>  Mx::DB->method
-#   Mx::Sybase->method    =>  Mx::DB->method
+#   use Mx::Sybase2  =>  use Mx::DB
+#   use Mx::Sybase   =>  use Mx::DB
 #
 # Usage:
 #   perl migrate_sybase_to_db.pl [options] <file_or_dir> [...]
@@ -77,7 +89,7 @@ sub process_file {
     my $original = do { local $/; <$fh> };
     close $fh;
 
-    my ($rewritten, $matches) = rewrite($original, $path);
+    my ($rewritten, $matches) = rewrite($original);
     return unless @$matches;
 
     $total_rewrites += scalar @$matches;
@@ -88,7 +100,9 @@ sub process_file {
     print "-" x 60, "\n";
 
     if ($verbose || $dry_run) {
-        printf "  line %d: %s  =>  Mx::DB\n", $_->{line}, $_->{old} for @$matches;
+        for my $m (@$matches) {
+            printf "  line %d: %s  =>  %s\n", $m->{line}, $m->{old}, $m->{new};
+        }
         print "\n";
         show_diff($original, $rewritten);
     }
@@ -106,21 +120,19 @@ sub process_file {
 }
 
 # ---------------------------------------------------------------------------
-# Core rewriter: returns ($new_source, \@matches)
-# Each match: { line => N, old => 'Mx::Sybase2' }
+# Core rewriter
+# Returns ($new_source, \@matches)
 # ---------------------------------------------------------------------------
 sub rewrite {
     my ($src) = @_;
     my @matches;
 
-    # Build a line-number index: offset -> line number
+    # Build offset -> line-number lookup
     my @line_starts = (0);
-    while ($src =~ /\n/g) {
-        push @line_starts, pos($src);
-    }
+    while ($src =~ /\n/g) { push @line_starts, pos($src) }
     my $offset_to_line = sub {
         my ($off) = @_;
-        my $lo = 0; my $hi = $#line_starts;
+        my ($lo, $hi) = (0, $#line_starts);
         while ($lo < $hi) {
             my $mid = int(($lo + $hi + 1) / 2);
             $line_starts[$mid] <= $off ? ($lo = $mid) : ($hi = $mid - 1);
@@ -128,22 +140,140 @@ sub rewrite {
         return $lo + 1;
     };
 
-    # Replace Mx::Sybase2-> and Mx::Sybase-> with Mx::DB->
-    # Collect matches first (with correct offsets), then substitute.
-    my $new = $src;
-    while ($src =~ /\b(Mx::Sybase2?)(->)/g) {
+    # -----------------------------------------------------------------------
+    # Pass 1: find and replace unless($var = Mx::Sybase2?->new(...)) { ... }
+    #
+    # Walk the source character by character, searching for the keyword
+    # "unless" followed by our pattern.  We use index() + manual paren
+    # balancing so multiline blocks are handled cleanly without \G.
+    # -----------------------------------------------------------------------
+    my $new = '';
+    my $pos = 0;
+    my $len = length($src);
+
+    while (1) {
+        # Find next 'unless' from current position
+        my $kw_pos = index($src, 'unless', $pos);
+        last if $kw_pos == -1;
+
+        # After 'unless' skip optional whitespace then expect '('
+        my $after_unless = substr($src, $kw_pos + 6);  # 6 = length('unless')
+        unless ($after_unless =~ /\A(\s*)\(/) {
+            # 'unless' not followed by '(' — copy up through it and continue
+            $new .= substr($src, $pos, $kw_pos - $pos + 6);
+            $pos  = $kw_pos + 6;
+            next;
+        }
+        my $ws1      = $1;
+        my $cond_open = $kw_pos + 6 + length($ws1) + 1;  # position after '('
+
+        # Check what follows the opening '(' — must be $var = Mx::Sybase2?->new
+        my $peek = substr($src, $cond_open);
+        unless ($peek =~ /\A\s*\$\w+\s*=\s*Mx::Sybase2?->new\s*\(/) {
+            # Not our pattern
+            $new .= substr($src, $pos, $kw_pos - $pos + 6 + length($ws1) + 1);
+            $pos  = $cond_open;
+            next;
+        }
+
+        # Balance parens for the condition (we are one level deep after '(')
+        my $cond_content = '';
+        my $depth = 1;
+        my $i = $cond_open;
+        while ($i < $len && $depth > 0) {
+            my $ch = substr($src, $i, 1);
+            $depth++ if $ch eq '(';
+            $depth-- if $ch eq ')';
+            $cond_content .= $ch unless $depth == 0;
+            $i++;
+        }
+        # $i is now just after the closing ')' of unless(...)
+
+        # Skip optional whitespace then expect '{'
+        my $after_cond = substr($src, $i);
+        unless ($after_cond =~ /\A(\s*)\{/) {
+            # Malformed — pass through
+            $new .= substr($src, $pos, $i - $pos);
+            $pos  = $i;
+            next;
+        }
+        $i += length($1) + 1;  # skip whitespace + '{'
+
+        # Balance braces for the block body
+        my $body = '';
+        $depth = 1;
+        while ($i < $len && $depth > 0) {
+            my $ch = substr($src, $i, 1);
+            $depth++ if $ch eq '{';
+            $depth-- if $ch eq '}';
+            $body .= $ch unless $depth == 0;
+            $i++;
+        }
+        # $i is now just after the closing '}'
+
+        # Determine db_role — KBC_MXDBREP first (it contains KBC_MXDB)
+        my $db_role;
+        if ($cond_content =~ /KBC_MXDBREP/) {
+            $db_role = 'REP';
+        } elsif ($cond_content =~ /KBC_MXDB/) {
+            $db_role = 'FIN';
+        } else {
+            warn "WARNING: line "
+                . $offset_to_line->($kw_pos)
+                . ": Mx::Sybase->new() found but no KBC_MXDB/KBC_MXDBREP in args; skipping.\n";
+            # Pass through the entire block unchanged
+            $new .= substr($src, $pos, $i - $pos);
+            $pos  = $i;
+            next;
+        }
+
+        # Determine indentation from the text before 'unless' on its line
+        my $indent = '';
+        my $before_kw = substr($src, $pos, $kw_pos - $pos);
+        if ($before_kw =~ /([^\n]*)\z/) {
+            ($indent = $1) =~ s/\S.*//s;  # only leading whitespace
+        }
+
+        my $replacement =
+            "${indent}my \$db = Mx::DB->new( config => \$config, logger => \$logger,\n"
+          . "${indent}                       auto_account => 1, db_role => '$db_role' );\n"
+          . "${indent}unless (\$db) {"
+          . $body
+          . "}\n";
+
         push @matches, {
-            line => $offset_to_line->(pos($src) - length($1) - length($2)),
-            old  => $1,
+            line => $offset_to_line->($kw_pos),
+            old  => 'Mx::Sybase' . ($cond_content =~ /Mx::Sybase2/ ? '2' : '') . '->new(...) [KBC_MXDB' . ($db_role eq 'REP' ? 'REP' : '') . ']',
+            new  => "Mx::DB->new(..., db_role => '$db_role')",
+        };
+
+        $new .= substr($src, $pos, $kw_pos - $pos) . $replacement;
+        $pos  = $i;
+    }
+
+    # Append remainder
+    $new .= substr($src, $pos);
+
+    # -----------------------------------------------------------------------
+    # Pass 2: rewrite remaining bare Mx::Sybase2?-> references
+    # -----------------------------------------------------------------------
+    while ($new =~ /\b(Mx::Sybase2?)(->)/g) {
+        push @matches, {
+            line => $offset_to_line->(pos($new) - length($1) - length($2)),
+            old  => $1 . '->',
+            new  => 'Mx::DB->',
         };
     }
     $new =~ s/\bMx::Sybase2?->/Mx::DB->/g;
 
-    # Replace use Mx::Sybase2 / use Mx::Sybase
+    # -----------------------------------------------------------------------
+    # Pass 3: rewrite use Mx::Sybase2 / use Mx::Sybase declarations
+    # -----------------------------------------------------------------------
     while ($src =~ /\b(use\s+)(Mx::Sybase2?)\b/g) {
         push @matches, {
             line => $offset_to_line->(pos($src) - length($2)),
             old  => "use $2",
+            new  => 'use Mx::DB',
         };
     }
     $new =~ s/\buse\s+Mx::Sybase2?\b/use Mx::DB/g;
