@@ -119,29 +119,27 @@ for my $stmt (@$var_decls) {
         }
     }
 
+    # The only valid outcomes are db_role => 'FIN'/'REP' and $fin_db/$rep_db --
+    # if we can't confidently resolve to one of those, leave this declaration
+    # untouched rather than guess a different name or role.
     my $db_arg = $args{database} // '';
-    my ($db_role_expr, $new_var_name, $role_resolved);
+    my ($db_role, $new_var_name);
     if ($db_arg =~ /^\$\w+\s*->\s*(\w+)$/) {
-        # database => $config->SOME_ACCESSOR -- map the accessor name to a
-        # db_role. Can't be resolved statically if it's not in the table.
         my $accessor = $1;
-        if (my $role = $accessor_role_map{$accessor}) {
-            $db_role_expr  = "'$role'";
-            $new_var_name  = '$' . lc($role) . '_db';
-            $role_resolved = 1;
-        }
-        else {
-            $db_role_expr = $db_arg;
-            $new_var_name = '$' . $bare_old_name . '_db';
-        }
+        $db_role = $accessor_role_map{$accessor};
+    }
+    if ($db_role && $db_role eq 'FIN') {
+        $new_var_name = '$fin_db';
+    }
+    elsif ($db_role && $db_role eq 'REP') {
+        $new_var_name = '$rep_db';
     }
     else {
-        # Anything other than $var->ACCESSOR (a literal string, bare
-        # variable, or missing arg) can't be resolved to a role -- preserve
-        # it as-is and fall back to a name derived from the old variable.
-        $db_role_expr = $db_arg || 'undef';
-        $new_var_name = '$' . $bare_old_name . '_db';
+        warn "WARNING: could not resolve $old_var_name to a FIN/REP db_role"
+           . " (database => $db_arg) -- left unconverted, please handle manually.\n";
+        next;
     }
+    my $db_role_expr = "'$db_role'";
 
     my $config_expr = $args{config} // '$config';
     my $logger_expr = $args{logger} // '$logger';
@@ -201,7 +199,6 @@ for my $stmt (@$var_decls) {
         symbols       => \@in_scope_refs,
         strings       => \@in_scope_strings,
         new_text      => $new_text,
-        role_resolved => $role_resolved,
     };
 }
 
@@ -232,13 +229,35 @@ for my $item (@plan) {
 }
 
 # ---------------------------------------------------------------------
-# PHASE D: rewrite the `use Mx::Sybase2;` line(s)
+# PHASE D: fix up `use` line(s). If every Mx::Sybase2->new(...) call in the
+# file got converted, just rename `use Mx::Sybase2;` to `use Mx::DB;`. If
+# some were left unconverted (db_role couldn't be resolved), Mx::Sybase2 is
+# still needed at runtime, so keep it and add `use Mx::DB;` alongside it.
 # ---------------------------------------------------------------------
-my $includes = $doc->find('PPI::Statement::Include') || [];
-for my $inc (@$includes) {
-    next unless $inc->module && $inc->module eq $OLD_MODULE;
-    my $module_token = $inc->schild(1);
-    $module_token->set_content($NEW_MODULE) if $module_token;
+if (@plan) {
+    my $remaining_old_refs = $doc->find(sub {
+        my (undef, $n) = @_;
+        return 0 unless $n->isa('PPI::Token::Word');
+        return 0 unless $n->content eq $OLD_MODULE;
+        return !($n->parent && $n->parent->isa('PPI::Statement::Include'));
+    }) || [];
+
+    my $includes = $doc->find('PPI::Statement::Include') || [];
+    my ($old_include) = grep { $_->module && $_->module eq $OLD_MODULE } @$includes;
+    my ($new_include) = grep { $_->module && $_->module eq $NEW_MODULE } @$includes;
+
+    if ($old_include) {
+        if (@$remaining_old_refs) {
+            unless ($new_include) {
+                my $mini = PPI::Document->new(\"\nuse $NEW_MODULE;");
+                $old_include->insert_after($_->clone) for reverse $mini->children;
+            }
+        }
+        else {
+            my $module_token = $old_include->schild(1);
+            $module_token->set_content($NEW_MODULE) if $module_token;
+        }
+    }
 }
 
 # ---------------------------------------------------------------------
@@ -254,8 +273,6 @@ for my $item (@plan) {
     printf "  %s -> %s  (renamed %d reference%s)\n",
         $item->{old_name}, $item->{new_name},
         scalar(@{ $item->{symbols} }), (@{ $item->{symbols} } == 1 ? '' : 's');
-    warn "WARNING: could not resolve db_role for $item->{old_name} -- check $item->{new_name}'s db_role value in $out_file\n"
-        unless $item->{role_resolved};
 }
 
 # Best-effort safety net: flag any occurrence of an old variable name that
