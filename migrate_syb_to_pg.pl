@@ -7,11 +7,6 @@ use PPI;
 # ---------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------
-my %db_name_map = (
-    FIN_DB => 'FIN',
-    HR_DB  => 'HR',
-);
-
 # Real scripts pass database => $config->SOME_ACCESSOR rather than a literal
 # string. Map the accessor name to the db_role value Mx::DB expects.
 my %accessor_role_map = (
@@ -140,15 +135,9 @@ for my $stmt (@$var_decls) {
             $new_var_name = '$' . $bare_old_name . '_db';
         }
     }
-    elsif ($db_arg =~ /^'(.*)'$/) {
-        my $literal = $1;
-        my $mapped_db = $db_name_map{$literal} // $literal;
-        $db_role_expr  = "'$mapped_db'";
-        $new_var_name  = '$' . lc($mapped_db) . '_db';
-        $role_resolved = 1;
-    }
     else {
-        # Unresolvable expression (bare variable, missing, etc.) -- preserve
+        # Anything other than $var->ACCESSOR (a literal string, bare
+        # variable, or missing arg) can't be resolved to a role -- preserve
         # it as-is and fall back to a name derived from the old variable.
         $db_role_expr = $db_arg || 'undef';
         $new_var_name = '$' . $bare_old_name . '_db';
