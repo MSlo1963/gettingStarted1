@@ -12,9 +12,16 @@ my %db_name_map = (
     HR_DB  => 'HR',
 );
 
+# Real scripts pass database => $config->SOME_ACCESSOR rather than a literal
+# string. Map the accessor name to the db_role value Mx::DB expects.
+my %accessor_role_map = (
+    DB_NAME => 'FIN',
+    DB_REP  => 'REP',
+);
+
 my $OLD_MODULE = 'Mx::Sybase2';
 my $NEW_MODULE = 'Mx::DB';
-my $FLAVOUR    = 'sybase2';
+my $FLAVOUR    = 'sybase2';   # used as the `compat` value in the new call
 
 die "Usage: $0 <file.pl>\n" unless @ARGV;
 my $file = shift @ARGV;
@@ -112,32 +119,58 @@ for my $stmt (@$var_decls) {
     my %args;
     if ($arg_list) {
         my $arg_text = $arg_list->content;
-        while ($arg_text =~ /(\w+)\s*=>?\s*('[^']*'|\$\w+)/g) {
+        while ($arg_text =~ /(\w+)\s*=>?\s*('[^']*'|\$\w+(?:\s*->\s*\w+)*)/g) {
             $args{$1} = $2;
         }
     }
 
     my $db_arg = $args{database} // '';
-    my ($db_expr, $new_var_name);
-    if ($db_arg =~ /^\$/) {
-        # Database name is a runtime expression (e.g. a variable), not a
-        # literal -- we can't statically know its value, so preserve the
-        # expression as-is rather than quoting it as a string, and derive
-        # the new variable name from the old one instead of the unknown value.
-        $db_expr     = $db_arg;
-        $new_var_name = '$' . $bare_old_name . '_db';
+    my ($db_role_expr, $new_var_name, $role_resolved);
+    if ($db_arg =~ /^\$\w+\s*->\s*(\w+)$/) {
+        # database => $config->SOME_ACCESSOR -- map the accessor name to a
+        # db_role. Can't be resolved statically if it's not in the table.
+        my $accessor = $1;
+        if (my $role = $accessor_role_map{$accessor}) {
+            $db_role_expr  = "'$role'";
+            $new_var_name  = '$' . lc($role) . '_db';
+            $role_resolved = 1;
+        }
+        else {
+            $db_role_expr = $db_arg;
+            $new_var_name = '$' . $bare_old_name . '_db';
+        }
+    }
+    elsif ($db_arg =~ /^'(.*)'$/) {
+        my $literal = $1;
+        my $mapped_db = $db_name_map{$literal} // $literal;
+        $db_role_expr  = "'$mapped_db'";
+        $new_var_name  = '$' . lc($mapped_db) . '_db';
+        $role_resolved = 1;
     }
     else {
-        (my $literal = $db_arg) =~ s/^'|'$//g;
-        my $mapped_db = $db_name_map{$literal} // $literal;
-        $db_expr      = "'$mapped_db'";
-        $new_var_name = '$' . lc($mapped_db) . '_db';
+        # Unresolvable expression (bare variable, missing, etc.) -- preserve
+        # it as-is and fall back to a name derived from the old variable.
+        $db_role_expr = $db_arg || 'undef';
+        $new_var_name = '$' . $bare_old_name . '_db';
     }
 
-    my $account_part = exists $args{account} ? ", account => $args{account}" : '';
+    my $config_expr = $args{config} // '$config';
+    my $logger_expr = $args{logger} // '$logger';
+
     my $new_text = sprintf(
-        "my %s = %s->new(flavour => '%s', database => %s%s);",
-        $new_var_name, $NEW_MODULE, $FLAVOUR, $db_expr, $account_part
+        "my %s;\n" .
+        "unless (\n" .
+        "    %s = %s->new(\n" .
+        "        config => %s,\n" .
+        "        logger => %s,\n" .
+        "        auto_account => 1,\n" .
+        "        db_role => %s,\n" .
+        "        compat => '%s')\n" .
+        ") {\n" .
+        "    \$script->fail_and_die(\"exception %s->new\");\n" .
+        "}",
+        $new_var_name, $new_var_name, $NEW_MODULE,
+        $config_expr, $logger_expr, $db_role_expr, $FLAVOUR, $NEW_MODULE
     );
 
     my $scope_root = find_scope_root($stmt);
@@ -179,6 +212,7 @@ for my $stmt (@$var_decls) {
         symbols       => \@in_scope_refs,
         strings       => \@in_scope_strings,
         new_text      => $new_text,
+        role_resolved => $role_resolved,
     };
 }
 
@@ -201,9 +235,10 @@ for my $item (@plan) {
 # ---------------------------------------------------------------------
 for my $item (@plan) {
     my $replacement_doc = PPI::Document->new(\$item->{new_text});
-    my ($new_stmt) = $replacement_doc->schildren;
-    my $cloned = $new_stmt->clone;   # fully detached copy, safe to move across documents
-    $item->{stmt}->insert_before($cloned);
+    for my $new_elem ($replacement_doc->children) {  # includes whitespace, to preserve layout
+        my $cloned = $new_elem->clone;   # fully detached copy, safe to move across documents
+        $item->{stmt}->insert_before($cloned);
+    }
     $item->{stmt}->remove;
 }
 
@@ -230,6 +265,8 @@ for my $item (@plan) {
     printf "  %s -> %s  (renamed %d reference%s)\n",
         $item->{old_name}, $item->{new_name},
         scalar(@{ $item->{symbols} }), (@{ $item->{symbols} } == 1 ? '' : 's');
+    warn "WARNING: could not resolve db_role for $item->{old_name} -- check $item->{new_name}'s db_role value in $out_file\n"
+        unless $item->{role_resolved};
 }
 
 # Best-effort safety net: flag any occurrence of an old variable name that
