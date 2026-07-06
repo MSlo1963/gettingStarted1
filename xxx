@@ -1,0 +1,29 @@
+package xxx;
+
+use strict;
+use warnings;
+use parent -norequire, 'Mx::DB';
+
+sub do {
+    my ($self, %args) = @_;
+    my $stmt   = $args{statement} // '';
+    my $values = $args{values}   // [];
+
+    warn "[SQL] $stmt\n";
+    warn "[BIND] " . join(', ', map { defined $_ ? $_ : 'NULL' } @$values) . "\n";
+
+    my $bind_count  = () = $stmt =~ /\?/g;
+    my $value_count = scalar @$values;
+    if ($bind_count != $value_count) {
+        die sprintf("Bind mismatch: %d placeholder(s), %d value(s)\nSQL: %s\n",
+            $bind_count, $value_count, $stmt);
+    }
+
+    if ($stmt =~ /_{2,}[A-Za-z0-9]+_{2,}/) {
+        die "Unresolved template placeholder still present:\n$stmt\n";
+    }
+
+    return $self->SUPER::do(%args);
+}
+
+1;
