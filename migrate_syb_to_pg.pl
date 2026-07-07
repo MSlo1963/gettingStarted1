@@ -230,34 +230,7 @@ for my $item (@plan) {
 }
 
 # ---------------------------------------------------------------------
-# PHASE D: wrap each renamed variable's `->open();` call in the same
-# unless/fail_and_die failure handling used for ->new().
-# ---------------------------------------------------------------------
-for my $item (@plan) {
-    my $open_stmts = $doc->find(sub {
-        my (undef, $n) = @_;
-        return 0 unless $n->isa('PPI::Statement');
-        return $n->content =~ /^\Q$item->{new_name}\E\s*->\s*open\s*\(\s*\)\s*;?\s*$/;
-    }) || [];
-
-    for my $stmt (@$open_stmts) {
-        my $new_text = sprintf(
-            "unless (%s->open()) {\n" .
-            "    \$script->fail_and_die('exception on %s->open');\n" .
-            "}",
-            $item->{new_name}, $item->{new_name}
-        );
-        my $replacement_doc = PPI::Document->new(\$new_text);
-        for my $new_elem ($replacement_doc->children) {
-            my $cloned = $new_elem->clone;
-            $stmt->insert_before($cloned);
-        }
-        $stmt->remove;
-    }
-}
-
-# ---------------------------------------------------------------------
-# PHASE E: fix up `use` line(s). If every Mx::Sybase2->new(...) call in the
+# PHASE D: fix up `use` line(s). If every Mx::Sybase2->new(...) call in the
 # file got converted, just rename `use Mx::Sybase2;` to `use Mx::DB;`. If
 # some were left unconverted (db_role couldn't be resolved), Mx::Sybase2 is
 # still needed at runtime, so keep it and add `use Mx::DB;` alongside it.
@@ -289,7 +262,7 @@ if (@plan) {
 }
 
 # ---------------------------------------------------------------------
-# PHASE F: remove `my $x = Mx::Account->new(...);` declarations entirely.
+# PHASE E: remove `my $x = Mx::Account->new(...);` declarations entirely.
 # With auto_account => 1, Mx::DB resolves the account itself, so the
 # explicit Mx::Account object -- and any comment lines sitting directly
 # above it explaining it -- is no longer needed.
@@ -342,7 +315,7 @@ if (@$account_decls) {
 }
 
 # ---------------------------------------------------------------------
-# PHASE G: write out, report, verify
+# PHASE F: write out, report, verify
 # ---------------------------------------------------------------------
 my $out_file = "$file.converted";
 open my $fh, '>', $out_file or die "Can't write $out_file: $!";
