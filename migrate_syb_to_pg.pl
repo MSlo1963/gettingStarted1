@@ -14,8 +14,9 @@ my %accessor_role_map = (
     DB_REP  => 'REP',
 );
 
-my $OLD_MODULE = 'Mx::Sybase2';
-my $NEW_MODULE = 'Mx::DB';
+my $OLD_MODULE    = 'Mx::Sybase2';
+my $NEW_MODULE    = 'Mx::DB';
+my $ACCOUNT_MODULE = 'Mx::Account';   # no longer needed once auto_account => 1 is used
 my $FLAVOUR    = 'sybase2';   # used as the `compat` value in the new call
 
 die "Usage: $0 <file.pl>\n" unless @ARGV;
@@ -229,7 +230,34 @@ for my $item (@plan) {
 }
 
 # ---------------------------------------------------------------------
-# PHASE D: fix up `use` line(s). If every Mx::Sybase2->new(...) call in the
+# PHASE D: wrap each renamed variable's `->open();` call in the same
+# unless/fail_and_die failure handling used for ->new().
+# ---------------------------------------------------------------------
+for my $item (@plan) {
+    my $open_stmts = $doc->find(sub {
+        my (undef, $n) = @_;
+        return 0 unless $n->isa('PPI::Statement');
+        return $n->content =~ /^\Q$item->{new_name}\E\s*->\s*open\s*\(\s*\)\s*;?\s*$/;
+    }) || [];
+
+    for my $stmt (@$open_stmts) {
+        my $new_text = sprintf(
+            "unless (%s->open()) {\n" .
+            "    \$script->fail_and_die('exception on %s->open');\n" .
+            "}",
+            $item->{new_name}, $item->{new_name}
+        );
+        my $replacement_doc = PPI::Document->new(\$new_text);
+        for my $new_elem ($replacement_doc->children) {
+            my $cloned = $new_elem->clone;
+            $stmt->insert_before($cloned);
+        }
+        $stmt->remove;
+    }
+}
+
+# ---------------------------------------------------------------------
+# PHASE E: fix up `use` line(s). If every Mx::Sybase2->new(...) call in the
 # file got converted, just rename `use Mx::Sybase2;` to `use Mx::DB;`. If
 # some were left unconverted (db_role couldn't be resolved), Mx::Sybase2 is
 # still needed at runtime, so keep it and add `use Mx::DB;` alongside it.
@@ -261,7 +289,60 @@ if (@plan) {
 }
 
 # ---------------------------------------------------------------------
-# PHASE E: write out, report, verify
+# PHASE F: remove `my $x = Mx::Account->new(...);` declarations entirely.
+# With auto_account => 1, Mx::DB resolves the account itself, so the
+# explicit Mx::Account object -- and any comment lines sitting directly
+# above it explaining it -- is no longer needed.
+# ---------------------------------------------------------------------
+my $account_decls = $doc->find(sub {
+    my (undef, $n) = @_;
+    return 0 unless $n->isa('PPI::Statement::Variable');
+    return 0 unless $n->type eq 'my';
+    return $n->content =~ /\Q$ACCOUNT_MODULE\E\s*->\s*new\b/;
+}) || [];
+
+for my $stmt (@$account_decls) {
+    my @to_remove;
+    my $prev = $stmt->previous_sibling;
+    while ($prev) {
+        if ($prev->isa('PPI::Token::Comment')) {
+            push @to_remove, $prev;
+        }
+        elsif ($prev->isa('PPI::Token::Whitespace') && ($prev->content =~ tr/\n//) <= 1) {
+            push @to_remove, $prev;   # indentation, or the single newline before the comment block
+        }
+        else {
+            last;
+        }
+        $prev = $prev->previous_sibling;
+    }
+    $_->remove for @to_remove;
+    $stmt->remove;
+}
+
+# Drop `use Mx::Account;` too, but only if nothing still references it
+# (e.g. a non-`my` assignment we didn't touch).
+if (@$account_decls) {
+    my $remaining_account_refs = $doc->find(sub {
+        my (undef, $n) = @_;
+        return 0 unless $n->isa('PPI::Token::Word');
+        return 0 unless $n->content eq $ACCOUNT_MODULE;
+        return !($n->parent && $n->parent->isa('PPI::Statement::Include'));
+    }) || [];
+
+    unless (@$remaining_account_refs) {
+        my $acct_includes = $doc->find('PPI::Statement::Include') || [];
+        for my $inc (@$acct_includes) {
+            next unless $inc->module && $inc->module eq $ACCOUNT_MODULE;
+            my $prev = $inc->previous_sibling;
+            $prev->remove if $prev && $prev->isa('PPI::Token::Whitespace') && ($prev->content =~ tr/\n//) <= 1;
+            $inc->remove;
+        }
+    }
+}
+
+# ---------------------------------------------------------------------
+# PHASE G: write out, report, verify
 # ---------------------------------------------------------------------
 my $out_file = "$file.converted";
 open my $fh, '>', $out_file or die "Can't write $out_file: $!";
