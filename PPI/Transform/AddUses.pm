@@ -3,6 +3,7 @@ use strict;
 use warnings;
 use parent 'PPI::Transform';
 use PPI;
+use Scalar::Util qw(refaddr);
 
 my @REQUIRED = qw( Mx::DB Mx::PerlScript Mx::SQLLibrary Data::Dumper );
 
@@ -40,15 +41,30 @@ sub document {
     }
     my $anchor = $kids[$idx];  # first real content after the header, if any
 
-    # 2. Add the new required modules to our list, counting only genuinely
+    # 2. A required module might already be use'd somewhere outside the
+    # contiguous header block (e.g. after a comment that breaks the
+    # header run, or further down the file) -- check the whole document,
+    # not just @header, so we don't add a duplicate 'use' for it.
+    my %used_elsewhere;
+    my %header_addrs = map { (refaddr($_) => 1) } @header;
+    my $all_includes = $doc->find('PPI::Statement::Include') || [];
+    foreach my $inc (@$all_includes) {
+        next if $header_addrs{ refaddr($inc) };
+        my $mod = $inc->module;
+        $used_elsewhere{$mod} = 1 if $mod;
+    }
+
+    # 3. Add the new required modules to our list, counting only genuinely
     # new additions as "changes" -- every existing use is kept regardless.
     my $added = 0;
     foreach my $req (@REQUIRED) {
-        $added++ unless $final_modules{$req};
+        next if $final_modules{$req};   # already in the header
+        next if $used_elsewhere{$req};  # already use'd further down -- don't duplicate it
         $final_modules{$req} = 1;
+        $added++;
     }
 
-    # 3. Create the new consolidated string (sorted looks best). We put
+    # 4. Create the new consolidated string (sorted looks best). We put
     # 'strict' and 'warnings' first if they exist. A single trailing blank
     # line separates the header from whatever real content follows.
     my @sorted = sort keys %final_modules;
@@ -63,7 +79,7 @@ sub document {
         return 0;
     }
 
-    # 4. Clear out the old header (old uses + the blank lines between/
+    # 5. Clear out the old header (old uses + the blank lines between/
     # around them) -- we rebuild it from scratch so nothing is left behind.
     $_->delete for @header;
 
@@ -73,7 +89,7 @@ sub document {
     }
     $new_code .= "\n" if $anchor;
 
-    # 5. Splice the rebuilt header in after the shebang (or at the very
+    # 6. Splice the rebuilt header in after the shebang (or at the very
     # top if there wasn't one). We insert directly via the Node-level
     # __insert_before_child()/__insert_after_child() primitives instead
     # of the public insert_before()/insert_after() methods: those refuse
