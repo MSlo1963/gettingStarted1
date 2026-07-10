@@ -132,6 +132,17 @@ END_NEW_CODE
             if ($next && $next->isa('PPI::Token::Whitespace')) { $next->delete; }
             $stmt->delete;
 
+            # Any other reference to the old variable elsewhere in the
+            # document (e.g. "$sybase->open()") would otherwise be left
+            # dangling/undeclared once the declaration above is gone --
+            # rename those to the new variable too.
+            if (defined $old_var_name && $old_var_name ne $var_name) {
+                my $other_refs = $doc->find(sub {
+                    $_[1]->isa('PPI::Token::Symbol') && $_[1]->content eq $old_var_name
+                });
+                $_->set_content($var_name) for @{ $other_refs || [] };
+            }
+
             $changes++;
             push @var_pairs, [$old_var_name, $var_name];
         }
