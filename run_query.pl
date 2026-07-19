@@ -112,7 +112,7 @@ eval {
 $dbh->disconnect;
 exit 0;
 
-# --- SELECT handling: MD5 + preview ---
+# --- SELECT handling: MD5 (raw + normalized) + preview ---
 sub run_select {
     my ($dbh, $sql) = @_;
 
@@ -120,15 +120,19 @@ sub run_select {
     $sth->execute;
     my $rows = $sth->fetchall_arrayref;
 
-    my @normalized = map {
-        normalize_row(join(",", map { defined($_) ? $_ : '' } @$_))
+    my @raw = map {
+        join(",", map { defined($_) ? $_ : '' } @$_)
     } @$rows;
 
-    my $hash = md5_hex(join("\n", @normalized));
+    my @normalized = map { normalize_row($_) } @raw;
 
-    print "MD5: $hash\n";
+    my $hash_raw        = md5_hex(join("\n", @raw));
+    my $hash_normalized = md5_hex(join("\n", @normalized));
+
+    print "MD5 (raw):        $hash_raw\n";
+    print "MD5 (normalized): $hash_normalized\n";
     print "Row count: " . scalar(@$rows) . "\n";
-    print "First 3 rows:\n";
+    print "First 3 rows (normalized):\n";
 
     my $preview_count = scalar(@normalized) > 3 ? 3 : scalar(@normalized);
     for my $i (0 .. $preview_count - 1) {
